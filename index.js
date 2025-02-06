@@ -1,22 +1,36 @@
 import 'dotenv/config';
+import {Client, GatewayIntentBits} from 'discord.js';
+import Pushover from 'node-pushover';
 
-import nodemailer from 'nodemailer';
-import { JWT } from 'google-auth-library';
-const SCOPES = ['https://www.googleapis.com/auth/firebase.messaging'];
-import { Client, GatewayIntentBits } from 'discord.js';
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]});
 if (process.env.DISCORD_TOKEN) {
     await client.login(process.env.DISCORD_TOKEN);
 }
 
+const pushOver = process.env.PUSHOVER_TOKEN && process.env.PUSHOVER_USER_KEY ? new Pushover({
+    token: process.env.PUSHOVER_TOKEN,
+    user: process.env.PUSHOVER_USER_KEY
+}) : null;
+
 const interval = Math.max(1, Number(process.env.INTERVAL) || 60) * 1000
 const locale = process.env.LOCALE || 'de-de';
 const localeFEInventory = process.env.LOCALE_FEINVENTORY || 'DE';
+
+
 const gpus = {
-    'RTX 5090': process.env.RTX_5090,
-    'RTX 5080': process.env.RTX_5080
-};
-const selectedGPUs = Object.keys(gpus).filter(key => gpus[key] === 'true').map(key => encodeURI(key)).join();
+    'RTX_5090': {
+        enabled: process.env.RTX_5090 && process.env.RTX_5090 !== 'false',
+        gpuParam: 'RTX 5090'
+    },
+    'RTX_5080': {
+        enabled: process.env.RTX_5080 && process.env.RTX_5080 !== 'false',
+        gpuParam: 'RTX 5080'
+    }
+}
+
+
+const selectedGPUs = Object.keys(gpus).filter(key => gpus?.[key]?.enabled).map(key => encodeURI(gpus?.[key]?.gpuParam)).join();
+
 if (selectedGPUs.length === 0) {
     console.log('No GPUs selected. Enable at least one GPU in your .env file.');
     process.exit();
@@ -42,7 +56,7 @@ const options = {
 
 /**
  * Available types:
- * 
+ *
  * 29: "Check Availability"
  * 76: "Buy Now"
  * 75: "Buy Now"
@@ -57,11 +71,8 @@ let currentTypes = {};
  */
 let currentFEInventory = {};
 
-// Fetch once to get current availability
-fetchProducts(false);
-setInterval(() => {
-    fetchProducts(true);
-}, interval);
+// Send startup notification
+
 
 async function fetchProducts(sendNotification) {
     const date = new Date();
@@ -81,7 +92,7 @@ async function fetchProducts(sendNotification) {
 
     const time = date.toISOString();
 
-    if (process.env.RTX_5090) {
+    if (gpus['RTX_5090'].enabled) {
         const listMap = await fetchFEInventory(urlsFEInventory[0]);
         if (listMap) {
             const wasActiveNVGFT590 = currentFEInventory[`NVGFT590_${localeFEInventory}`];
@@ -94,7 +105,7 @@ async function fetchProducts(sendNotification) {
                     isActiveNVGFT590 = true;
                     console.log(`${time}: [${productTitle}] [FEInventory] - Available at ${product_url}`);
                     if (!wasActiveNVGFT590 && sendNotification) {
-                        notify(productTitle, product_url);
+                        await notify(productTitle, product_url);
                     }
                 } else {
                     console.log(`${time}: [${productTitle}] [FEInventory] - Out of stock`);
@@ -104,7 +115,7 @@ async function fetchProducts(sendNotification) {
         }
     }
 
-    if (process.env.RTX_5080) {
+    if (gpus['RTX_5080'].enabled) {
         const listMap = await fetchFEInventory(urlsFEInventory[1]);
         if (listMap) {
             const wasActiveNVGFT580 = currentFEInventory[`NVGFT580_${localeFEInventory}`];
@@ -117,7 +128,7 @@ async function fetchProducts(sendNotification) {
                     isActiveNVGFT580 = true;
                     console.log(`${time}: [${productTitle}] [FEInventory] - Available at ${product_url}`);
                     if (!wasActiveNVGFT580 && sendNotification) {
-                        notify(productTitle, product_url);
+                        await notify(productTitle, product_url);
                     }
                 } else {
                     console.log(`${time}: [${productTitle}] [FEInventory] - Out of stock`);
@@ -170,49 +181,63 @@ async function fetchProducts(sendNotification) {
     }
 }
 
-function notify(productTitle, purchaseLink) {
-    sendMail(productTitle, purchaseLink);
-    sendDiscordMessage(productTitle, purchaseLink);
-    sendFCMNotification(productTitle, purchaseLink);
+
+function scheduleFetch() {
+    const randomInterval = interval + Math.floor(Math.random() * interval);
+
+    console.log(`Next check in ${randomInterval / 1000} seconds...`);
+
+    setTimeout(() => {
+        fetchProducts(true).then(scheduleFetch)
+    }, randomInterval);
 }
 
-async function sendMail(productTitle, purchaseLink) {
-    try {
-        const json = await import('./nodemailer.json', { with: { type: 'json' } });
-        if (!json) {
-            return;
-        }
+// Fetch once to get current availability
+fetchProducts(false).then(scheduleFetch)
 
-        const transport = json.default;
-        const transporter = nodemailer.createTransport(transport);
-
-        const mailOptions = {
-            from: transport.auth.user,
-            to: transport.auth.user,
-            subject: productTitle,
-            text: purchaseLink
-        };
-
-        try {
-            const info = await transporter.sendMail(mailOptions);
-            console.log('Email sent: ' + info.response);
-        } catch (error) {
-            console.log(error);
-        }
-    } catch (error) {
-        console.log('No nodemailer.json found:', error.message);
-    }
+async function notify(productTitle, purchaseLink) {
+    return Promise.all(
+        [sendProductDiscordMessage(productTitle, purchaseLink), sendProductPushover(productTitle, purchaseLink)]
+    );
 }
 
-async function sendDiscordMessage(productTitle, purchaseLink) {
+async function sendProductPushover(productTitle, purchaseLink) {
+    await sendPushover(productTitle, `${productTitle} - Available at ${purchaseLink}`);
+}
+
+async function sendPushover(title, message) {
+    return new Promise((resolve => {
+            if (!pushOver) {
+                resolve();
+                return;
+            }
+
+            try {
+                pushOver.send(title, message, function (err, res) {
+                    if (err) return console.log(err);
+                    resolve(res);
+                });
+
+            } catch (error) {
+                console.log(error);
+                resolve();
+            }
+        })
+    );
+}
+
+async function sendProductDiscordMessage(productTitle, purchaseLink) {
+    return sendDiscordMessage(productTitle, `${productTitle} - Available at ${purchaseLink}`);
+}
+
+async function sendDiscordMessage(title, message) {
     // Channel notification
     if (process.env.DISCORD_CHANNEL_ID) {
-        let message = `${productTitle} - Available at ${purchaseLink}`;
         if (process.env.DISCORD_ROLE_ID) {
             message = `<@&${process.env.DISCORD_ROLE_ID}> ` + message;
         }
         const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID)
-        channel.send(message);
+        await channel.send(message);
     }
 
     // User notification
@@ -220,68 +245,14 @@ async function sendDiscordMessage(productTitle, purchaseLink) {
         const userIds = process.env.DISCORD_USER_IDS.split(';');
         for (const userId of userIds) {
             const user = await client.users.fetch(userId);
-            user.send(`${productTitle} - Available at ${purchaseLink}`);
+            await user.send(message);
         }
     }
 }
 
-async function sendFCMNotification(productTitle, purchaseLink) {
-    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-        return;
-    }
-
-    const accessToken = await getAccessToken();
-    const data = JSON.stringify({
-        "message": {
-            "topic": "nvidia-notifier",
-            /*"notification": {
-                "title": productTitle,
-                "body": purchaseLink
-            },*/
-            "data": {
-                "productTitle": productTitle,
-                "purchaseLink": purchaseLink
-            },
-            "android": {
-                "priority": "high"
-            }
-            /*"webpush": {
-                "fcm_options": {
-                    "link": purchaseLink
-                }
-            }*/
-        }
-    });
-
-    const json = await import(process.env.GOOGLE_APPLICATION_CREDENTIALS, { with: { type: 'json' } });
-    const projectId = json.default.project_id;
-
-    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send?access_token=${accessToken}`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': data.length
-        },
-        body: data
-    });
-    console.log(await response.text());
-}
-
-async function getAccessToken() {
-    const json = await import(process.env.GOOGLE_APPLICATION_CREDENTIALS, { with: { type: 'json' } });
-    const key = json.default;
-    const jwtClient = new JWT(
-        key.client_email,
-        null,
-        key.private_key,
-        SCOPES,
-        null
-    );
-    const credentials = await jwtClient.authorize()
-    return credentials.access_token;
-}
 
 async function fetchFEInventory(url) {
+    console.log(`Fetching ${url}...`);
     try {
         const response = await fetch(url, options);
         const json = await response.json();
